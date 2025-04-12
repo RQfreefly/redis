@@ -139,8 +139,13 @@ int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sd
     } else if (set->encoding == OBJ_ENCODING_LISTPACK) {
         unsigned char *lp = set->ptr;
         unsigned char *p = lpFirst(lp);
-        if (p != NULL)
-            p = lpFind(lp, p, (unsigned char*)str, len, 0);
+        if (p != NULL) {
+            if (str == tmpbuf) {
+                p = lpFindInteger(lp, p, llval, 0);
+            } else {
+                p = lpFind(lp, p, (unsigned char*)str, len, 0);
+            }
+        }
         if (p == NULL) {
             /* Not found.  */
             if (lpLength(lp) < server.set_max_listpack_entries &&
@@ -148,8 +153,7 @@ int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sd
                 lpSafeToAdd(lp, len))
             {
                 if (str == tmpbuf) {
-                    /* This came in as integer so we can avoid parsing it again.
-                     * TODO: Create and use lpFindInteger; don't go via string. */
+                    /* This came in as integer so we can avoid parsing it again.*/
                     lp = lpAppendInteger(lp, llval);
                 } else {
                     lp = lpAppend(lp, (unsigned char*)str, len);
@@ -588,6 +592,7 @@ robj *setTypeDup(robj *o) {
 void saddCommand(client *c) {
     robj *set;
     int j, added = 0;
+    long long llval;
 
     set = lookupKeyWrite(c->db,c->argv[1]);
     if (checkType(c,set,OBJ_SET)) return;
@@ -599,9 +604,23 @@ void saddCommand(client *c) {
         setTypeMaybeConvert(set, c->argc - 2);
     }
 
+    /* Check if we're using an encoding that benefits from integer optimization.
+     * Both intset and listpack encodings have special handling for integers. */
+    int optimized_encoding = (set->encoding == OBJ_ENCODING_INTSET ||
+                              set->encoding == OBJ_ENCODING_LISTPACK);
     for (j = 2; j < c->argc; j++) {
-        if (setTypeAdd(set,c->argv[j]->ptr)) added++;
+        if (optimized_encoding && isSdsRepresentableAsLongLong(c->argv[j]->ptr, &llval) == C_OK) {
+            if (setTypeAddAux(set, NULL, 0, llval, 0)) added++;
+        } else {
+            if (setTypeAdd(set, c->argv[j]->ptr)) added++;
+        }
+
+        if (optimized_encoding && set->encoding != OBJ_ENCODING_INTSET &&
+            set->encoding != OBJ_ENCODING_LISTPACK) {
+            optimized_encoding = 0;
+        }
     }
+
     if (added) {
         unsigned long size = setTypeSize(set);
         updateKeysizesHist(c->db, getKeySlot(c->argv[1]->ptr), OBJ_SET, size - added, size);
